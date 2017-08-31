@@ -517,8 +517,9 @@ func (db *DB) getBlock(id ulid.ULID) (DiskBlock, bool) {
 
 func (db *DB) readWAL(r WALReader) error {
 
-	seriesFunc := func(series []labels.Labels) error {
-		for _, lset := range series {
+	seriesFunc := func(series []RefSeries) error {
+		for _, s := range series {
+			lset := s.Labels
 			db.head.create(lset.Hash(), lset)
 			db.metrics.headSeries.Inc()
 			db.metrics.headSeriesCreated.Inc()
@@ -634,7 +635,14 @@ func (db *DB) reload() (err error) {
 
 	start = time.Now()
 
-	if err := db.wal.Truncate(maxt); err != nil {
+	ir := db.head.Index()
+	// TODO handle err.
+	p, err := ir.Postings("", "")
+	if err != nil {
+		return err
+	}
+
+	if err := db.wal.Truncate(maxt, p); err != nil {
 		return errors.Wrapf(err, "truncate WAL at %d", maxt)
 	}
 	db.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
@@ -840,9 +848,9 @@ type dbAppender struct {
 	wal  WAL
 	mint int64
 
-	newSeries []*hashedLabels
-	newLabels []labels.Labels
-	newHashes map[uint64]uint64
+	newSeries     []*hashedLabels
+	createdSeries []RefSeries
+	newHashes     map[uint64]uint64
 
 	samples       []RefSample
 	highTimestamp int64
@@ -949,7 +957,7 @@ func (a *dbAppender) createSeries() error {
 	if len(a.newSeries) == 0 {
 		return nil
 	}
-	a.newLabels = make([]labels.Labels, 0, len(a.newSeries))
+	a.createdSeries = make([]RefSeries, 0, len(a.newSeries))
 	base0 := len(a.head.series)
 
 	a.head.mtx.RUnlock()
@@ -969,17 +977,17 @@ func (a *dbAppender) createSeries() error {
 			}
 		}
 		// Series is still new.
-		a.newLabels = append(a.newLabels, l.labels)
 
 		s := a.head.create(l.hash, l.labels)
 		l.ref = uint64(s.ref)
+		a.createdSeries = append(a.createdSeries, RefSeries{Ref: l.ref, Labels: l.labels})
 
 		a.db.metrics.headSeriesCreated.Inc()
 		a.db.metrics.headSeries.Inc()
 	}
 
 	// Write all new series to the WAL.
-	if err := a.wal.LogSeries(a.newLabels); err != nil {
+	if err := a.wal.LogSeries(a.createdSeries); err != nil {
 		return errors.Wrap(err, "WAL log series")
 	}
 

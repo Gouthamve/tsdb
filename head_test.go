@@ -36,7 +36,7 @@ func BenchmarkCreateSeries(b *testing.B) {
 		require.NoError(b, err)
 		defer os.RemoveAll(dir)
 
-		h, err := NewHead(nil, nil, 10000)
+		h, err := NewHead(nil, 10000)
 		if err != nil {
 			require.NoError(b, err)
 		}
