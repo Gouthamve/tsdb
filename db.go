@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/tsdb/fileutil"
+	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 )
 
@@ -217,6 +218,11 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	if err != nil {
 		return nil, err
 	}
+
+	if err := db.repairFormat(); err != nil {
+		return nil, err
+	}
+
 	if err := db.reload(); err != nil {
 		return nil, err
 	}
@@ -528,6 +534,35 @@ func (db *DB) reload(deleteable ...string) (err error) {
 	maxt := blocks[len(blocks)-1].Meta().MaxTime
 
 	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
+}
+
+func (db *DB) repairFormat() error {
+	dirs, err := blockDirs(db.dir)
+	if err != nil {
+		return errors.Wrap(err, "find blocks")
+	}
+
+	for _, dir := range dirs {
+		meta, err := readMetaFile(dir)
+		if err != nil {
+			return errors.Wrapf(err, "read meta information %s", dir)
+		}
+
+		if meta.Version == 1 {
+			continue
+		}
+
+		if err := index.SetVersion2(filepath.Join(dir, "index")); err != nil {
+			return errors.Wrapf(err, "set index format %s", dir)
+		}
+
+		meta.Version = 1
+		if err := writeMetaFile(dir, meta); err != nil {
+			return errors.Wrapf(err, "write updated meta %s", dir)
+		}
+	}
+
+	return nil
 }
 
 func validateBlockSequence(bs []*Block) error {

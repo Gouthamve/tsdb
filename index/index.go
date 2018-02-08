@@ -37,6 +37,7 @@ const (
 	MagicIndex = 0xBAAAD700
 
 	indexFormatV1 = 1
+	indexFormatV2 = 2
 )
 
 type indexWriterSeries struct {
@@ -123,7 +124,7 @@ type Writer struct {
 
 	crc32 hash.Hash
 
-	Version int
+	version int
 }
 
 type indexTOC struct {
@@ -169,7 +170,7 @@ func NewWriter(fn string) (*Writer, error) {
 		seriesOffsets: make(map[uint64]uint64, 1<<16),
 		crc32:         newCRC32(),
 
-		Version: 2,
+		version: 2,
 	}
 	if err := iw.writeMeta(); err != nil {
 		return nil, err
@@ -249,7 +250,7 @@ func (w *Writer) ensureStage(s indexWriterStage) error {
 func (w *Writer) writeMeta() error {
 	w.buf1.reset()
 	w.buf1.putBE32(MagicIndex)
-	w.buf1.putByte(indexFormatV1)
+	w.buf1.putByte(indexFormatV2)
 
 	return w.write(w.buf1.get())
 }
@@ -543,7 +544,7 @@ type Reader struct {
 
 	crc32 hash.Hash32
 
-	version int
+	version byte
 }
 
 var (
@@ -573,24 +574,20 @@ func (b realByteSlice) Sub(start, end int) ByteSlice {
 }
 
 // NewReader returns a new IndexReader on the given byte slice.
-func NewReader(b ByteSlice, version int) (*Reader, error) {
-	return newReader(b, nil, version)
+func NewReader(b ByteSlice) (*Reader, error) {
+	return newReader(b, nil)
 }
 
 // NewFileReader returns a new index reader against the given index file.
-func NewFileReader(path string, version int) (*Reader, error) {
+func NewFileReader(path string) (*Reader, error) {
 	f, err := fileutil.OpenMmapFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return newReader(realByteSlice(f.Bytes()), f, version)
+	return newReader(realByteSlice(f.Bytes()), f)
 }
 
-func newReader(b ByteSlice, c io.Closer, version int) (*Reader, error) {
-	if version != 1 && version != 2 {
-		return nil, errors.Errorf("unexpected file version %d", version)
-	}
-
+func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 	r := &Reader{
 		b:        b,
 		c:        c,
@@ -598,7 +595,6 @@ func newReader(b ByteSlice, c io.Closer, version int) (*Reader, error) {
 		labels:   map[string]uint32{},
 		postings: map[labels.Label]uint32{},
 		crc32:    newCRC32(),
-		version:  version,
 	}
 
 	// Verify magic number.
@@ -607,6 +603,12 @@ func newReader(b ByteSlice, c io.Closer, version int) (*Reader, error) {
 	}
 	if m := binary.BigEndian.Uint32(r.b.Range(0, 4)); m != MagicIndex {
 		return nil, errors.Errorf("invalid magic number %x", m)
+	}
+
+	if v := r.b.Range(4, 5); v[0] != indexFormatV1 && v[0] != indexFormatV2 {
+		return nil, errors.Errorf("invalid index format %x", v)
+	} else {
+		r.version = v[0]
 	}
 
 	if err := r.readTOC(); err != nil {
@@ -1079,4 +1081,67 @@ func (dec *Decoder) Series(b []byte, lbls *labels.Labels, chks *[]chunks.Meta) e
 		})
 	}
 	return d.err()
+}
+
+// SetVersion2 is a cleanup function that fixes wrong versioning introduced in 2.1
+// and will be deleted in later versions.
+func SetVersion2(path string) error {
+	tmpPath := path + ".tmp"
+	if err := os.RemoveAll(tmpPath); err != nil {
+		return errors.Wrap(err, "remove existing index if any")
+	}
+
+	from, err := os.Open(path)
+	if err != nil {
+		return errors.Wrap(err, "open original index")
+	}
+
+	to, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		return errors.Wrap(err, "create tmp index file")
+	}
+
+	_, err = io.Copy(to, from)
+	if err != nil {
+		return errors.Wrap(err, "write to new index file")
+	}
+
+	_, err = to.Seek(5, 0)
+	if err != nil {
+		return errors.Wrap(err, "seek to version offset")
+	}
+	_, err = to.Write([]byte{indexFormatV2})
+	if err != nil {
+		return errors.Wrap(err, "set new format")
+	}
+
+	if err := from.Close(); err != nil {
+		return errors.Wrap(err, "close old index")
+	}
+	if err := from.Close(); err != nil {
+		return errors.Wrap(err, "close new index")
+	}
+
+	return renameFile(tmpPath, path)
+}
+
+func renameFile(from, to string) error {
+	if err := os.RemoveAll(to); err != nil {
+		return err
+	}
+	if err := os.Rename(from, to); err != nil {
+		return err
+	}
+
+	// Directory was renamed; sync parent dir to persist rename.
+	pdir, err := fileutil.OpenDir(filepath.Dir(to))
+	if err != nil {
+		return err
+	}
+
+	if err = fileutil.Fsync(pdir); err != nil {
+		pdir.Close()
+		return err
+	}
+	return pdir.Close()
 }

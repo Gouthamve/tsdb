@@ -85,7 +85,6 @@ func NewMustRegexpMatcher(name, pattern string) Matcher {
 		panic(err)
 	}
 	return &regexpMatcher{name: name, re: re}
-
 }
 
 // notMatcher inverts the matching result for a matcher.
